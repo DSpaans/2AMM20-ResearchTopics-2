@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chargax"
+version = "0.1.0"
+description = "A project for EV charging analysis"
+authors = [
+    { name = "Your Name", email = "your.email@example.com" }
+]
+readme = "README.md"
+keywords = ["EV", "charging", "analysis"]
+dependencies = [
+    "jax[cuda12]",
+    "equinox",
+    "distrax",
+    "chex",
+    "optax",
+]
+
+[project.urls]
+"Homepage"="https://github.com/username/chargax"
+
+[tool.setuptools.package-data]
+chargax = ["data/*.csv"]
+
+[tool.pytest.ini_options]
+addopts = [
+    "--import-mode=importlib",
+]
