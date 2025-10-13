@@ -231,7 +231,15 @@ if __name__ == "__main__":
     env_parameters_str = "_".join([f"{k}_{v}" for k, v in env_parameters.items()])
     groupname = f"{groupname}_{env_parameters_str}"
     c_time = time.time()
-    wandb.init(project="chargax", entity="FelixAndKoen", config=merged_config, group=groupname, tags=[args.runtag], dir="/var/scratch/kponse/wandb")
+    wandb_tags = [args.runtag] if args.runtag is not None else []
+    wandb.init(
+        project="chargaxTest",
+        entity="shmvdhelm-technical-university-eindhoven",
+        config=merged_config,
+        group=groupname,
+        tags=wandb_tags,
+        dir="/var/scratch/kponse/wandb"
+    )
     trained_runner_state, train_rewards = random_trainer_train_fn()
     print("Training finished")
     print(f"Training took {time.time() - c_time:.2f} seconds")
