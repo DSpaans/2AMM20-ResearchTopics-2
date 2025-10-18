@@ -5,7 +5,8 @@ from chargax import (
     get_car_data,
     pretty_print_charger_group,
     build_random_trainer,
-    build_ppo_trainer
+    build_ppo_trainer,
+    build_ppo_lagrangian_trainer
 )
 
 import jax 
@@ -202,11 +203,29 @@ if __name__ == "__main__":
     )
 
     baselines = create_baseline_rewards(env)
-    random_trainer_train_fn, config = build_ppo_trainer(
+    random_trainer_train_fn, config = build_ppo_lagrangian_trainer(
         env, 
         config_params={
             "total_timesteps": 10000000,
-            "seed": args.seed
+            "seed": args.seed,
+            # ADDED lagranginan params
+            "cost_keys": (
+                "charged_satisfaction",   # -> uncharged_kw
+                "time_satisfaction",      # -> charged_overtime - beta*charged_undertime
+                "rejected_customers",     # -> rejected_customers
+                "capacity_exceeded",      # -> exceeded_capacity
+                "battery_degradation",    # -> total_discharged_kw
+            ),
+            "cost_limits": [
+                0.05,   # charged_satisfaction (uncharged_kw) per step
+                0.00,   # time_satisfaction composite per step (aim ≤ 0)
+                0.02,   # rejected_customers per step
+                0.00,   # capacity_exceeded per step (hard)
+                0.00,   # battery_degradation proxy per step (if you want to discourage discharge)
+            ],
+            "alpha_init": 0.0,
+            "alpha_lr": 0.05,
+            "alpha_max": 1e6,
         },
         baselines=baselines
     )#, {"num_envs": 1, "total_timesteps": 1000})

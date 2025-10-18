@@ -3,8 +3,9 @@ import jax.numpy as jnp
 import equinox as eqx
 import chex
 import optax
-from typing import NamedTuple, List
+from typing import NamedTuple, List, Sequence
 from dataclasses import replace
+from typing import Sequence, Dict, List, NamedTuple
 
 from chargax import Chargax, LogWrapper, NormalizeVecObservation
 from chargax.algorithms.networks import ActorNetworkMultiDiscrete, CriticNetwork
@@ -44,6 +45,22 @@ class PPOConfig:
     seed: int = 42
     debug: bool = False
     evaluate_deterministically: bool = False
+    
+    # ADDED Extra parameters for lagrangian PPO
+    cost_keys: Sequence[str] = ("exceeded_capacity",)  # TODO must match info["logging_data"]
+    cost_limits: jnp.ndarray = jnp.array((0.0,), dtype=jnp.float32)
+    alpha_init: float = 0.0
+    alpha_lr: float = 0.05
+    alpha_max: float = 1e6
+    
+    # list order of the α vector order and logging labels.
+    cost_keys: Sequence[str] = (
+        "charged_satisfaction",   # uses logging 'uncharged_kw'
+        "time_satisfaction",      # composite: charged_overtime - beta*charged_undertime
+        "rejected_customers",     # uses logging 'rejected_customers'
+        "capacity_exceeded",      # uses logging 'exceeded_capacity'
+        "battery_degradation",    # uses logging 'total_discharged_kw'
+    )
 
     @property
     def num_iterations(self):
@@ -69,14 +86,56 @@ class Transition:
     value: chex.Array
     log_prob: chex.Array
     info: chex.Array
+    # ADDED extras for Lagrangian
+    costs: chex.Array # shape: (num_envs, num_costs)
+    profit_delta: chex.Array # per-step profit change
 
 class TrainState(NamedTuple):
     actor: eqx.Module
     critic: eqx.Module
     optimizer_state: optax.OptState
+    alphas: chex.Array # TODO shape: (num_costs,)
+
+def _extract_cost_deltas(curr_logging: Dict[str, chex.Array],
+                         prev_logging: Dict[str, chex.Array],
+                         cost_keys: Sequence[str],
+                         beta: float
+                         ) -> chex.Array:
+    """
+    Build per-env cost increments for each requested cost key, in order.
+    Supports:
+      - "capacity_exceeded"        -> logging "exceeded_capacity"
+      - "charged_satisfaction"     -> logging "uncharged_kw"            (penalize unmet energy)
+      - "time_satisfaction"        -> (charged_overtime - beta * charged_undertime)
+      - "rejected_customers"       -> logging "rejected_customers"
+      - "battery_degradation"      -> logging "total_discharged_kw"
+    Also accepts direct logging names ("uncharged_kw","exceeded_capacity",...) as cost_keys.
+    Output shape: (num_envs, num_costs)
+    """
+    direct_map = {
+        "capacity_exceeded": "exceeded_capacity",
+        "charged_satisfaction": "uncharged_kw",
+        "rejected_customers": "rejected_customers",
+        "battery_degradation": "total_discharged_kw",
+    }
+    deltas = []
+    for k in cost_keys:
+        if k == "time_satisfaction":
+            co_curr = curr_logging["charged_overtime"]
+            co_prev = prev_logging["charged_overtime"]
+            cu_curr = curr_logging["charged_undertime"]
+            cu_prev = prev_logging["charged_undertime"]
+            delta = (co_curr - co_prev) - beta * (cu_curr - cu_prev)
+        else:
+            # allow either friendly name or exact logging key
+            key = direct_map.get(k, k)
+            delta = (curr_logging[key] - prev_logging[key]).astype(jnp.float32)
+        deltas.append(delta.astype(jnp.float32))
+    return jnp.stack(deltas, axis=-1)
+
 
 # Jit the returned function, not this function
-def build_ppo_trainer(
+def build_ppo_lagrangian_trainer(
         env: Chargax,
         config_params: dict = {},
         baselines: dict = {}, # Will be inserted every wandb log step
@@ -92,6 +151,13 @@ def build_ppo_trainer(
     logging_baselines = baselines
 
     config = PPOConfig(**config_params)
+    
+    # ADDED cost info
+    beta = getattr(env, "beta", 0.0)
+    num_costs = len(tuple(config.cost_keys))
+    cost_limits = jnp.asarray(config.cost_limits, dtype=jnp.float32).reshape((num_costs,))
+    
+
 
     # rng keys
     rng = jax.random.PRNGKey(config.seed)
@@ -129,7 +195,8 @@ def build_ppo_trainer(
     train_state = TrainState(
         actor=actor,
         critic=critic,
-        optimizer_state=optimizer_state
+        optimizer_state=optimizer_state,
+        alphas=jnp.ones((num_costs,), dtype=jnp.float32) * jnp.float32(config.alpha_init),
     )
 
     rng, key = jax.random.split(rng)
@@ -148,6 +215,9 @@ def build_ppo_trainer(
                 action = action_dist.sample(seed=action_key)
             (obs, reward, terminated, truncated, info), env_state = env.step(step_key, env_state, action)
             done = jnp.logical_or(terminated, truncated)
+            
+            
+            
             episode_reward += reward
             return (rng, obs, env_state, done, episode_reward)
         
@@ -169,7 +239,7 @@ def build_ppo_trainer(
         # functions prepended with _ are called in jax.lax.scan of train_step
 
         def _env_step(runner_state, _):
-            train_state, env_state, last_obs, rng = runner_state
+            train_state, env_state, last_obs, rng, prev_logging = runner_state
             rng, sample_key, step_key = jax.random.split(rng, 3)
 
             # select an action
@@ -184,6 +254,16 @@ def build_ppo_trainer(
                 env.step, in_axes=(0, 0, 0)
             )(step_key, env_state, action)
             done = jnp.logical_or(terminated, truncated)
+            
+            # ADDED Lagrangian reward calculation
+            curr_logging = info["logging_data"]
+            costs = _extract_cost_deltas(curr_logging, prev_logging, config.cost_keys, beta)  # (num_envs, num_costs)
+            profit_delta = (curr_logging["profit"] - prev_logging["profit"]).astype(jnp.float32)
+
+            # Lagrangian reward:
+            # env_reward should already be profit_delta, but we re-use profit_delta for clarity if you prefer.
+            r_lag = reward - jnp.sum(costs * train_state.alphas, axis=-1)
+
 
             # jax.debug.breakpoint()
 
@@ -192,14 +272,16 @@ def build_ppo_trainer(
             transition = Transition(
                 observation=last_obs,
                 action=action,
-                reward=reward,
+                reward=r_lag,
                 done=done,
                 value=value,
                 log_prob=log_prob,
-                info=info
+                info=info,
+                costs=costs,
+                profit_delta=profit_delta,
             )
 
-            runner_state = (train_state, env_state, obsv, rng)
+            runner_state = (train_state, env_state, obsv, rng, curr_logging)
             return runner_state, transition
         
         def _calculate_gae(gae_and_next_value, transition):
@@ -270,11 +352,12 @@ def build_ppo_trainer(
                 train_state = TrainState(
                     actor=new_networks["actor"],
                     critic=new_networks["critic"],
-                    optimizer_state=optimizer_state
+                    optimizer_state=optimizer_state,
+                    alphas=train_state.alphas,
                 )
                 return train_state, total_loss
-            
-            train_state, trajectory_batch, advantages, returns, rng = update_state
+
+            train_state, trajectory_batch, advantages, returns, rng, prev_logging = update_state
             rng, key = jax.random.split(rng)
 
             batch_idx = jax.random.permutation(key, config.batch_size)
@@ -296,6 +379,27 @@ def build_ppo_trainer(
             train_state, total_loss = jax.lax.scan(
                 __update_over_minibatch, train_state, minibatches
             )
+            
+            # Lagrangian
+            # trajectory_batch.costs must be collected during rollout: shape (num_steps, num_envs, num_costs)
+            costs_batch = trajectory_batch.costs
+            mean_costs = costs_batch.mean(axis=(0, 1))       # (num_costs,)
+            violations = mean_costs - cost_limits            # (num_costs,)
+
+            new_alphas = jnp.clip(
+                train_state.alphas + config.alpha_lr * violations,
+                0.0,
+                config.alpha_max,
+            )
+
+            # write alphas back into TrainState
+            train_state = TrainState(
+                actor=train_state.actor,
+                critic=train_state.critic,
+                optimizer_state=train_state.optimizer_state,
+                alphas=new_alphas,
+            )
+            
             update_state = (train_state, trajectory_batch, advantages, returns, rng)
             return update_state, total_loss
 
@@ -307,7 +411,7 @@ def build_ppo_trainer(
             )
 
             # calculate gae
-            train_state, env_state, last_obs, rng = runner_state
+            train_state, env_state, last_obs, rng, prev_logging = runner_state
             last_value = jax.vmap(train_state.critic)(last_obs)
             _, (advantages, returns) = jax.lax.scan(
                 _calculate_gae,
@@ -331,8 +435,11 @@ def build_ppo_trainer(
             rng, eval_key = jax.random.split(rng)
             eval_rewards = eval_func(train_state, eval_key)
             metric["eval_rewards"] = eval_rewards
+            
+            costs_batch = trajectory_batch.costs
+            mean_costs = costs_batch.mean(axis=(0, 1))
 
-            def callback(info):
+            def callback(info, alphas, mean_cost):
                 if config.debug:
                     print(f'timestep={(info["train_timestep"][-1][0] * config.num_envs)}, eval rewards={info["eval_rewards"]}')
                 if wandb.run:
@@ -343,20 +450,39 @@ def build_ppo_trainer(
                         info["logging_data"] = jax.tree.map(
                             lambda x: x[finished_episodes].mean(), info["logging_data"]
                         )
-                        wandb.log({
-                            "timestep": info["train_timestep"][-1][0] * config.num_envs, 
+                        log_dict = {
+                            "timestep": info["train_timestep"][-1][0] * config.num_envs,
                             "eval_rewards": info["eval_rewards"],
                             **info["logging_data"],
-                            **logging_baselines
-                        })
+                            **logging_baselines,
+                        }
 
-            jax.debug.callback(callback, metric)
+                        # add the 5 constraint logs (order matches config.cost_keys)
+                        for i, name in enumerate(config.cost_keys):
+                            log_dict[f"alpha/{name}"] = alphas[i]
+                            log_dict[f"cost/{name}_mean"] = mean_costs[i]
+                            log_dict[f"limit/{name}"] = cost_limits[i]
 
-            runner_state = (train_state, env_state, last_obs, rng)
+                        wandb.log(log_dict)
+
+            jax.debug.callback(callback, metric, train_state.alphas, mean_costs)
+
+            runner_state = (train_state, env_state, last_obs, rng, prev_logging)
             return runner_state, _ 
 
         rng, key = jax.random.split(rng)
-        runner_state = (train_state, env_state, obsv, key)
+        
+        zeros_logging = {
+            "profit": jnp.zeros((config.num_envs,)),
+            "exceeded_capacity": jnp.zeros((config.num_envs,)),
+            "uncharged_kw": jnp.zeros((config.num_envs,)),
+            "charged_overtime": jnp.zeros((config.num_envs,)),
+            "charged_undertime": jnp.zeros((config.num_envs,)),
+            "rejected_customers": jnp.zeros((config.num_envs,)),
+            "total_discharged_kw": jnp.zeros((config.num_envs,)),
+        }
+        
+        runner_state = (train_state, env_state, obsv, key, zeros_logging)
         trained_runner_state, train_metrics = jax.lax.scan(
             train_step, runner_state, None, config.num_iterations
         )
