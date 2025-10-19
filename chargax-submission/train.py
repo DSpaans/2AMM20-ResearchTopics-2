@@ -6,9 +6,8 @@ from chargax import (
     pretty_print_charger_group,
     build_random_trainer,
     build_ppo_trainer,
-    build_ppo_lagrangian_trainer
 )
-
+from chargax.algorithms.ppo_lagrangian import build_ppo_lagrangian_trainer
 import jax 
 import jax.numpy as jnp
 import time

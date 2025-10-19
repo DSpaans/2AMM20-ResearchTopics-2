@@ -4,7 +4,7 @@ import equinox as eqx
 import chex
 import optax
 from typing import NamedTuple, List, Sequence
-from dataclasses import replace
+from dataclasses import replace, field
 from typing import Sequence, Dict, List, NamedTuple
 
 from chargax import Chargax, LogWrapper, NormalizeVecObservation
@@ -47,9 +47,15 @@ class PPOConfig:
     evaluate_deterministically: bool = False
     
     # ADDED Extra parameters for lagrangian PPO
-    cost_keys: Sequence[str] = ("exceeded_capacity",)  # TODO must match info["logging_data"]
-    cost_limits: jnp.ndarray = jnp.array((0.0,), dtype=jnp.float32)
-    alpha_init: float = 0.0
+    cost_keys: Sequence[str] = (
+        "charged_satisfaction",
+        "time_satisfaction",
+        "rejected_customers",
+        "capacity_exceeded",
+        "battery_degradation",
+    )
+    cost_limits: jnp.ndarray = field(default_factory=lambda: jnp.array((0.0, 0.0, 0.0, 0.0, 0.0), dtype=jnp.float32))
+    alpha_init: float = 0.0 #Might have to change this
     alpha_lr: float = 0.05
     alpha_max: float = 1e6
     
@@ -256,7 +262,13 @@ def build_ppo_lagrangian_trainer(
             done = jnp.logical_or(terminated, truncated)
             
             # ADDED Lagrangian reward calculation
-            curr_logging = info["logging_data"]
+            raw_logging = info["logging_data"]
+            curr_logging = {
+                k: jnp.asarray(raw_logging.get(k, prev_logging[k]))
+                    .astype(prev_logging[k].dtype)
+                    .reshape(prev_logging[k].shape)
+                for k in prev_logging.keys()
+            }
             costs = _extract_cost_deltas(curr_logging, prev_logging, config.cost_keys, beta)  # (num_envs, num_costs)
             profit_delta = (curr_logging["profit"] - prev_logging["profit"]).astype(jnp.float32)
 
@@ -400,7 +412,7 @@ def build_ppo_lagrangian_trainer(
                 alphas=new_alphas,
             )
             
-            update_state = (train_state, trajectory_batch, advantages, returns, rng)
+            update_state = (train_state, trajectory_batch, advantages, returns, rng, prev_logging)
             return update_state, total_loss
 
         def train_step(runner_state, _):
@@ -422,15 +434,21 @@ def build_ppo_lagrangian_trainer(
             )
     
             # Do update epochs
-            update_state = (train_state, trajectory_batch, advantages, returns, rng)
+            update_state = (train_state, trajectory_batch, advantages, returns, rng, prev_logging)
             update_state, loss_info = jax.lax.scan(
                 _update_epoch, update_state, None, config.update_epochs
             )
 
-            train_state = update_state[0]
+            (train_state,
+            trajectory_batch,
+            advantages,
+            returns,
+            rng,
+            prev_logging) = update_state
+
             metric = trajectory_batch.info
             metric["loss_info"] = loss_info
-            rng = update_state[-1]
+
 
             rng, eval_key = jax.random.split(rng)
             eval_rewards = eval_func(train_state, eval_key)
@@ -439,7 +457,7 @@ def build_ppo_lagrangian_trainer(
             costs_batch = trajectory_batch.costs
             mean_costs = costs_batch.mean(axis=(0, 1))
 
-            def callback(info, alphas, mean_cost):
+            def callback(info, alphas, mean_costs, cost_limits_arg):
                 if config.debug:
                     print(f'timestep={(info["train_timestep"][-1][0] * config.num_envs)}, eval rewards={info["eval_rewards"]}')
                 if wandb.run:
@@ -461,11 +479,11 @@ def build_ppo_lagrangian_trainer(
                         for i, name in enumerate(config.cost_keys):
                             log_dict[f"alpha/{name}"] = alphas[i]
                             log_dict[f"cost/{name}_mean"] = mean_costs[i]
-                            log_dict[f"limit/{name}"] = cost_limits[i]
+                            log_dict[f"limit/{name}"] = cost_limits_arg[i]
 
                         wandb.log(log_dict)
 
-            jax.debug.callback(callback, metric, train_state.alphas, mean_costs)
+            jax.debug.callback(callback, metric, train_state.alphas, mean_costs, cost_limits)
 
             runner_state = (train_state, env_state, last_obs, rng, prev_logging)
             return runner_state, _ 
