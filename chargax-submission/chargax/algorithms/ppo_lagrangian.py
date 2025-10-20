@@ -18,11 +18,12 @@ def create_ppo_networks(
     critic_features: List[int],
     actions_nvec: int,
 ):
-    """Create PPO networks (actor critic)"""
-    actor_key, critic1_key = jax.random.split(key)
+    """Create PPO networks (actor, reward critic V(s), and cost criticV^C(s))"""
+    actor_key, critic_key, cost_critic_key = jax.random.split(key, 3)
     actor = ActorNetworkMultiDiscrete(actor_key, in_shape, actor_features, actions_nvec)
-    critic = CriticNetwork(critic1_key, in_shape, critic_features)
-    return actor, critic
+    critic = CriticNetwork(critic_key, in_shape, critic_features) # V(s) for reward
+    cost_critic = CriticNetwork(cost_critic_key, in_shape, critic_features) # V^C(s) for cost
+    return actor, critic, cost_critic
 
 @chex.dataclass(frozen=True)
 class PPOConfig:
@@ -34,7 +35,7 @@ class PPOConfig:
     clip_coef: float = 0.2
     clip_coef_vf: float = 10.0 # Depends on the reward scaling !
     ent_coef: float = 0.01
-    vf_coef: float = 0.25
+    vf_coef: float = 0.25 # Reward value lost rate
 
     total_timesteps: int = 5e6
     num_envs: int = 12
@@ -54,19 +55,18 @@ class PPOConfig:
         "capacity_exceeded",
         "battery_degradation",
     )
-    cost_limits: jnp.ndarray = field(default_factory=lambda: jnp.array((0.0, 0.0, 0.0, 0.0, 0.0), dtype=jnp.float32))
+    cost_limits: jnp.ndarray = field(default_factory=lambda: jnp.array((0.0, 0.05, 0.0, 0.0, 0.0), dtype=jnp.float32))
     alpha_init: float = 0.0 #Might have to change this
-    alpha_lr: float = 0.05
+    alpha_lr: float = 1e-3 #Conservative
     alpha_max: float = 1e6
+
+    # Value function weight
+    cost_vf_coef: float = 0.25 #Cost value lost weight
+
+    # Cost GAE
+    cost_gamma: float = 0.99
+    cost_gae_lambda: float = 0.95
     
-    # list order of the α vector order and logging labels.
-    cost_keys: Sequence[str] = (
-        "charged_satisfaction",   # uses logging 'uncharged_kw'
-        "time_satisfaction",      # composite: charged_overtime - beta*charged_undertime
-        "rejected_customers",     # uses logging 'rejected_customers'
-        "capacity_exceeded",      # uses logging 'exceeded_capacity'
-        "battery_degradation",    # uses logging 'total_discharged_kw'
-    )
 
     @property
     def num_iterations(self):
@@ -99,6 +99,7 @@ class Transition:
 class TrainState(NamedTuple):
     actor: eqx.Module
     critic: eqx.Module
+    cost_critic: eqx.Module # Added
     optimizer_state: optax.OptState
     alphas: chex.Array # TODO shape: (num_costs,)
 
@@ -157,6 +158,9 @@ def build_ppo_lagrangian_trainer(
     logging_baselines = baselines
 
     config = PPOConfig(**config_params)
+
+    # Choose one primary constraint for the policy loss
+    PRIMARY = tuple(config.cost_keys).index("capacity_exceeded")  # pick your primary
     
     # ADDED cost info
     beta = getattr(env, "beta", 0.0)
@@ -170,7 +174,7 @@ def build_ppo_lagrangian_trainer(
     rng, network_key, reset_key = jax.random.split(rng, 3)
 
     # networks
-    actor, critic = create_ppo_networks(
+    actor, critic, cost_critic = create_ppo_networks(
         key=network_key, 
         in_shape=observation_space.shape[0],
         actor_features=[256, 256], 
@@ -195,12 +199,14 @@ def build_ppo_lagrangian_trainer(
     )
     optimizer_state = optimizer.init({
         "actor": actor,
-        "critic": critic
+        "critic": critic,
+        "cost_critic": cost_critic,
     })
 
     train_state = TrainState(
         actor=actor,
         critic=critic,
+        cost_critic=cost_critic,
         optimizer_state=optimizer_state,
         alphas=jnp.ones((num_costs,), dtype=jnp.float32) * jnp.float32(config.alpha_init),
     )
@@ -272,11 +278,6 @@ def build_ppo_lagrangian_trainer(
             costs = _extract_cost_deltas(curr_logging, prev_logging, config.cost_keys, beta)  # (num_envs, num_costs)
             profit_delta = (curr_logging["profit"] - prev_logging["profit"]).astype(jnp.float32)
 
-            # Lagrangian reward:
-            # env_reward should already be profit_delta, but we re-use profit_delta for clarity if you prefer.
-            r_lag = reward - jnp.sum(costs * train_state.alphas, axis=-1)
-
-
             # jax.debug.breakpoint()
 
             # Build a single transition. Jax.lax.scan will build the batch
@@ -284,7 +285,7 @@ def build_ppo_lagrangian_trainer(
             transition = Transition(
                 observation=last_obs,
                 action=action,
-                reward=r_lag,
+                reward=reward,
                 done=done,
                 value=value,
                 log_prob=log_prob,
@@ -307,73 +308,118 @@ def build_ppo_lagrangian_trainer(
             gae = delta + config.gamma * config.gae_lambda * (1 - done) * gae
             return (gae, value), (gae, gae + value)
         
+        def _calculate_cost_gae(cost_gae_and_next_value, carry_tuple):
+            # GAE for costs using the cost critic. carry_tuple = (transition, next_cost_value)
+            gae, next_value_c = cost_gae_and_next_value
+            transition, = carry_tuple
+            done = transition.done
+            # current cost value V^C(s_t)
+            value_c_t = jax.vmap(train_state.cost_critic)(transition.observation)
+            # use per-step (scalar) cost for PRIMARY constraint
+            step_cost = transition.costs[..., PRIMARY]  # [num_envs]
+            delta = step_cost + config.cost_gamma * next_value_c * (1 - done) - value_c_t
+            gae = delta + config.cost_gamma * config.cost_gae_lambda * (1 - done) * gae
+            return (gae, value_c_t), (gae, gae + value_c_t)
+
+        
         def _update_epoch(update_state, _):
             """ Do one epoch of update"""
 
             @eqx.filter_value_and_grad(has_aux=True)
-            def __ppo_los_fn(params, trajectory_minibatch, advantages, returns):
+            def __ppo_los_fn(params, alpha_scalar, trajectory_minibatch,
+                             advantages, returns, cost_advantages, cost_returns):
+                # actor
                 action_dist = jax.vmap(params["actor"])(trajectory_minibatch.observation)
                 log_prob = action_dist.log_prob(trajectory_minibatch.action).sum(axis=-1)
                 entropy = action_dist.entropy().mean()
+
+                # critics
                 value = jax.vmap(params["critic"])(trajectory_minibatch.observation)
+                cost_value = jax.vmap(params["cost_critic"])(trajectory_minibatch.observation)
 
-                def ___ppo_actor_los():
-                    # actor loss 
-                    ratio = jnp.exp(log_prob - trajectory_minibatch.log_prob.sum(axis=-1))
-                    _advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-                    actor_loss1 = _advantages * ratio
-                    actor_loss2 = (
-                        jnp.clip(
-                            ratio, 1.0 - config.clip_coef, 1.0 + config.clip_coef
-                        ) * _advantages
-                    )
-                    actor_loss = -jnp.minimum(actor_loss1, actor_loss2).mean()
-                    return actor_loss
+                # ratios
+                ratio = jnp.exp(log_prob - trajectory_minibatch.log_prob.sum(axis=-1))
 
-                actor_loss = ___ppo_actor_los() 
+                # normalize both advantages
+                adv_r = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+                adv_c = (cost_advantages - cost_advantages.mean()) / (cost_advantages.std() + 1e-8)
 
-                value_pred_clipped = trajectory_minibatch.value + (
-                    jnp.clip(
-                        value - trajectory_minibatch.value, -config.clip_coef_vf, config.clip_coef_vf
-                    )
+                # combined advantage: A - α * A_c
+                comb = adv_r - jax.lax.stop_gradient(alpha_scalar) * adv_c
+
+                # clipped policy loss
+                actor_loss1 = comb * ratio
+                actor_loss2 = jnp.clip(ratio, 1.0 - config.clip_coef, 1.0 + config.clip_coef) * comb
+                actor_loss = -jnp.minimum(actor_loss1, actor_loss2).mean()
+
+                # reward value loss (clipped)
+                value_pred_clipped = trajectory_minibatch.value + jnp.clip(
+                    value - trajectory_minibatch.value, -config.clip_coef_vf, config.clip_coef_vf
                 )
                 value_losses = jnp.square(value - returns)
                 value_losses_clipped = jnp.square(value_pred_clipped - returns)
                 value_loss = jnp.maximum(value_losses, value_losses_clipped).mean()
 
-                # Total loss
+                # cost value loss (no clipping is fine)
+                cost_value_loss = jnp.square(cost_value - cost_returns).mean()
+
                 total_loss = (
-                    actor_loss 
+                    actor_loss
                     + config.vf_coef * value_loss
+                    + config.cost_vf_coef * cost_value_loss
                     - config.ent_coef * entropy
                 )
-                return total_loss, (actor_loss, value_loss, entropy)
-            
+                aux = (actor_loss, value_loss, cost_value_loss, entropy)
+                return total_loss, aux
+
             def __update_over_minibatch(train_state: TrainState, minibatch):
-                trajectory_mb, advantages_mb, returns_mb = minibatch
-                (total_loss, _), grads = __ppo_los_fn({
+                # Unpack minibatch leaves (now FIVE tensors)
+                trajectory_mb, advantages_mb, returns_mb, cost_adv_mb, cost_ret_mb = minibatch
+
+                # Use the PRIMARY constraint’s alpha for the combined advantage
+                alpha_primary = train_state.alphas[PRIMARY]
+
+                # Compute loss + grads
+                (total_loss, aux), grads = __ppo_los_fn(
+                    {
                         "actor": train_state.actor,
-                        "critic": train_state.critic
-                    }, trajectory_mb, advantages_mb, returns_mb
+                        "critic": train_state.critic,
+                        "cost_critic": train_state.cost_critic,
+                    },
+                    alpha_primary,
+                    trajectory_mb,
+                    advantages_mb, returns_mb,
+                    cost_adv_mb, cost_ret_mb,
                 )
+
+                # Optimizer step
                 updates, optimizer_state = optimizer.update(grads, train_state.optimizer_state)
-                new_networks = optax.apply_updates({
-                    "actor": train_state.actor,
-                    "critic": train_state.critic
-                }, updates)
+                new_params = optax.apply_updates(
+                    {
+                        "actor": train_state.actor,
+                        "critic": train_state.critic,
+                        "cost_critic": train_state.cost_critic,
+                    },
+                    updates
+                )
+
+                # Write back
                 train_state = TrainState(
-                    actor=new_networks["actor"],
-                    critic=new_networks["critic"],
+                    actor=new_params["actor"],
+                    critic=new_params["critic"],
+                    cost_critic=new_params["cost_critic"],
                     optimizer_state=optimizer_state,
                     alphas=train_state.alphas,
                 )
+
                 return train_state, total_loss
 
-            train_state, trajectory_batch, advantages, returns, rng, prev_logging = update_state
+
+            train_state, trajectory_batch, advantages, returns, cost_advantages, cost_returns, rng, prev_logging = update_state
             rng, key = jax.random.split(rng)
 
             batch_idx = jax.random.permutation(key, config.batch_size)
-            batch = (trajectory_batch, advantages, returns)
+            batch = (trajectory_batch, advantages, returns, cost_advantages, cost_returns)
             
             # reshape (flatten over first dimension)
             batch = jax.tree_util.tree_map(
@@ -408,11 +454,12 @@ def build_ppo_lagrangian_trainer(
             train_state = TrainState(
                 actor=train_state.actor,
                 critic=train_state.critic,
+                cost_critic=train_state.cost_critic,
                 optimizer_state=train_state.optimizer_state,
                 alphas=new_alphas,
             )
             
-            update_state = (train_state, trajectory_batch, advantages, returns, rng, prev_logging)
+            update_state = (train_state, trajectory_batch, advantages, returns, cost_advantages, cost_returns, rng, prev_logging)
             return update_state, total_loss
 
         def train_step(runner_state, _):
@@ -432,9 +479,22 @@ def build_ppo_lagrangian_trainer(
                 reverse=True,
                 unroll=16
             )
+            
+            # last cost value V^C(s_T)
+            last_cost_value = jax.vmap(train_state.cost_critic)(last_obs)
+            
+            # Running GAE over costs (treat per-step PRIMARY cost as "reward" in this stream)
+            _, (cost_advantages, cost_returns) = jax.lax.scan(
+                _calculate_cost_gae,
+                (jnp.zeros_like(last_cost_value), last_cost_value),
+                (trajectory_batch,),
+                reverse=True,
+                unroll=16
+            )
+
     
             # Do update epochs
-            update_state = (train_state, trajectory_batch, advantages, returns, rng, prev_logging)
+            update_state = (train_state, trajectory_batch, advantages, returns, cost_advantages, cost_returns, rng, prev_logging)
             update_state, loss_info = jax.lax.scan(
                 _update_epoch, update_state, None, config.update_epochs
             )
@@ -443,6 +503,8 @@ def build_ppo_lagrangian_trainer(
             trajectory_batch,
             advantages,
             returns,
+            cost_advantages,
+            cost_returns,
             rng,
             prev_logging) = update_state
 
