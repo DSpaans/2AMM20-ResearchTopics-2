@@ -18,6 +18,7 @@ from typing import Literal
 import numpy as np
 import equinox as eqx
 import argparse
+import itertools
 
 def eval_func(train_state, rng):
 
@@ -201,69 +202,100 @@ if __name__ == "__main__":
         **env_parameters
     )
 
-    baselines = create_baseline_rewards(env)
-    random_trainer_train_fn, config = build_ppo_lagrangian_trainer(
-        env, 
-        config_params={
-            "total_timesteps": 10000000,
-            "seed": args.seed,
-            # ADDED lagranginan params
-            "cost_keys": (
-            #    "charged_satisfaction",   # -> uncharged_kw
-            #    "time_satisfaction",      # -> charged_overtime - beta*charged_undertime
-            #    "rejected_customers",     # -> rejected_customers
-                "capacity_exceeded",      # -> exceeded_capacity
-            #    "battery_degradation",    # -> total_discharged_kw
-            ),
-            "cost_limits": [
-            #    0.10,   # charged_satisfaction (uncharged_kw) per step
-            #    0.00,   # time_satisfaction composite per step (aim ≤ 0)
-            #    0.00,   # rejected_customers per step
-                0.01,   # capacity_exceeded per step (hard)
-            #    0.05,   # battery_degradation proxy per step (if you want to discourage discharge)
-            ],
-            "alpha_init": 0.0,
-            "alpha_lr": 1e-3,
-            "alpha_max": 1e6,
-        },
-        baselines=baselines
-    )#, {"num_envs": 1, "total_timesteps": 1000})
-
-    filtered_env_dict = {
-        k: v for k, v in env.__dict__.items() if not isinstance(v, chex.Array)
-    }
-    merged_config = {
-        **filtered_env_dict,
-        **config.__dict__
+    # python train.py --user_profiles "residential" --arrival_frequency "medium"
+    param_grid = {
+        'capacity_exceeded_cost_limits': [
+            [0.001], [0.01], [0.1], [1.0],   # Only capacity_exceeded for now
+        ],
+        'alpha_init': [0.0, 0.1, 1.0],
+        'alpha_lr': [1e-4, 1e-3, 1e-2],
+        'alpha_max': [1e4, 1e5, 1e6]
     }
 
-    start_time = time.time()
-    print("Starting JAX compilation...")
-    random_trainer_train_fn = jax.jit(random_trainer_train_fn).lower().compile()
-    print(
-        f"JAX compilation finished in {(time.time() - start_time):.2f} seconds, starting training..."
-    )
-    groupname = args.groupname if args.groupname else args.user_profiles + "_" + args.arrival_frequency + args.car_profiles
-    if args.num_dc_groups is not None:
-        groupname += "_" + str(args.num_dc_groups)
-    env_parameters_str = "_".join([f"{k}_{v}" for k, v in env_parameters.items()])
-    groupname = f"{groupname}_{env_parameters_str}"
-    c_time = time.time()
-    wandb_tags = [args.runtag] if args.runtag is not None else []
-    wandb.init(
-        project="chargaxTest",
-        entity="shmvdhelm-technical-university-eindhoven",
-        config=merged_config,
-        group=groupname,
-        tags=wandb_tags,
-        dir="/var/scratch/kponse/wandb"
-    )
-    trained_runner_state, train_rewards = random_trainer_train_fn()
-    print("Training finished")
-    print(f"Training took {time.time() - c_time:.2f} seconds")
+    # Create all combinations
+    keys = param_grid.keys()
+    combinations = list(itertools.product(*param_grid.values()))
 
-    trained_agent = trained_runner_state[0]
-    key = trained_runner_state[-1]
+    best_reward = float('-inf')
+    best_params = None
+
+    for combo in combinations:
+        params = dict(zip(keys, combo))
+        print(f"Training with parameters: {params}")
+        baselines = create_baseline_rewards(env)
+        random_trainer_train_fn, config = build_ppo_lagrangian_trainer(
+            env, 
+            config_params={
+                "total_timesteps": 100000,
+                "seed": args.seed,
+                # ADDED lagranginan params
+                "cost_keys": (
+                #    "charged_satisfaction",   # -> uncharged_kw
+                #    "time_satisfaction",      # -> charged_overtime - beta*charged_undertime
+                #    "rejected_customers",     # -> rejected_customers
+                    "capacity_exceeded",      # -> exceeded_capacity
+                #    "battery_degradation",    # -> total_discharged_kw
+                ),
+                "cost_limits": [
+                #    0.10,   # charged_satisfaction (uncharged_kw) per step
+                #    0.00,   # time_satisfaction composite per step (aim ≤ 0)
+                #    0.00,   # rejected_customers per step
+                    params['capacity_exceeded_cost_limits'],   # capacity_exceeded per step (hard)
+                #    0.05,   # battery_degradation proxy per step (if you want to discourage discharge)
+                ],
+                "alpha_init": params['alpha_init'],
+                "alpha_lr": params['alpha_lr'],
+                "alpha_max": params['alpha_max'],
+            },
+            baselines=baselines
+        )#, {"num_envs": 1, "total_timesteps": 1000})
+
+        filtered_env_dict = {
+            k: v for k, v in env.__dict__.items() if not isinstance(v, chex.Array)
+        }
+        merged_config = {
+            **filtered_env_dict,
+            **config.__dict__,
+            **params
+        }
+
+        start_time = time.time()
+        print("Starting JAX compilation...")
+        random_trainer_train_fn = jax.jit(random_trainer_train_fn).lower().compile()
+        print(
+            f"JAX compilation finished in {(time.time() - start_time):.2f} seconds, starting training..."
+        )
+        groupname = args.groupname if args.groupname else args.user_profiles + "_" + args.arrival_frequency + args.car_profiles
+        if args.num_dc_groups is not None:
+            groupname += "_" + str(args.num_dc_groups)
+        env_parameters_str = "_".join([f"{k}_{v}" for k, v in env_parameters.items()])
+        groupname = f"{groupname}_{env_parameters_str}"
+        c_time = time.time()
+        wandb_tags = [args.runtag] if args.runtag is not None else []
+        wandb.init(
+            project="chargaxTest",
+            entity="shmvdhelm-technical-university-eindhoven",
+            config=merged_config,
+            group=groupname,
+            tags=wandb_tags,
+            dir="/var/scratch/kponse/wandb",
+            reinit=True
+        )
+        trained_runner_state, train_rewards = random_trainer_train_fn()
+        print("Training finished")
+        print(f"Training took {time.time() - c_time:.2f} seconds")
+
+        trained_agent = trained_runner_state[0]
+        key = trained_runner_state[-1]
+
+        avg_reward = float(np.mean(np.array(train_rewards)))
+
+        print(f"Combination {params} -> avg reward: {avg_reward:.3f}")
+        wandb.log({"avg_reward": avg_reward})
+
+        if avg_reward > best_reward:
+            best_reward = avg_reward
+            best_params = params
 
     # env = Chargax(
     #     elec_grid_buy_price=get_electricity_prices(),
@@ -271,7 +303,7 @@ if __name__ == "__main__":
     #     full_info_dict=True
     # )
 
-    wandb.finish()
+        wandb.finish()
 
     # episode_reward, infos = eval_func(trained_agent, key)
     # breakpoint()
