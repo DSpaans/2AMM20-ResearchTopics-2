@@ -204,12 +204,14 @@ if __name__ == "__main__":
 
     # python train.py --user_profiles "residential" --arrival_frequency "medium"
     param_grid = {
-        'capacity_exceeded_cost_limits': [
-            [0.001], [0.01], [0.1], [1.0],   # Only capacity_exceeded for now
-        ],
+        'charged_satisfaction_cost_limits': [0.0, 0.01, 0.1, 1.0],
+        'time_satisfaction_cost_limits': [0.0, 0.01, 0.1, 1.0],
+        'rejected_customers_cost_limits': [0.0, 0.01, 0.1, 1.0],
+        'capacity_exceeded_cost_limits': [0.0, 0.01, 0.1, 1.0],
+        'battery_degradation_cost_limits': [0.0, 0.01, 0.1, 1.0],
         'alpha_init': [0.0, 0.1, 1.0],
         'alpha_lr': [1e-4, 1e-3, 1e-2],
-        'alpha_max': [1e4, 1e5, 1e6]
+        'alpha_max': [1e4, 1e5, 1e6],
     }
 
     # Create all combinations
@@ -230,18 +232,18 @@ if __name__ == "__main__":
                 "seed": args.seed,
                 # ADDED lagranginan params
                 "cost_keys": (
-                #    "charged_satisfaction",   # -> uncharged_kw
-                #    "time_satisfaction",      # -> charged_overtime - beta*charged_undertime
-                #    "rejected_customers",     # -> rejected_customers
+                    "charged_satisfaction",   # -> uncharged_kw
+                    "time_satisfaction",      # -> charged_overtime - beta*charged_undertime
+                    "rejected_customers",     # -> rejected_customers
                     "capacity_exceeded",      # -> exceeded_capacity
-                #    "battery_degradation",    # -> total_discharged_kw
+                    "battery_degradation",    # -> total_discharged_kw
                 ),
                 "cost_limits": [
-                #    0.10,   # charged_satisfaction (uncharged_kw) per step
-                #    0.00,   # time_satisfaction composite per step (aim ≤ 0)
-                #    0.00,   # rejected_customers per step
+                    params['charged_satisfaction_cost_limits'],   # charged_satisfaction (uncharged_kw) per step
+                    params['time_satisfaction_cost_limits'],   # time_satisfaction composite per step (aim ≤ 0)
+                    params['rejected_customers_cost_limits'],   # rejected_customers per step
                     params['capacity_exceeded_cost_limits'],   # capacity_exceeded per step (hard)
-                #    0.05,   # battery_degradation proxy per step (if you want to discourage discharge)
+                    params['battery_degradation_cost_limits'],   # battery_degradation proxy per step (if you want to discourage discharge)
                 ],
                 "alpha_init": params['alpha_init'],
                 "alpha_lr": params['alpha_lr'],
@@ -265,22 +267,22 @@ if __name__ == "__main__":
         print(
             f"JAX compilation finished in {(time.time() - start_time):.2f} seconds, starting training..."
         )
-        groupname = args.groupname if args.groupname else args.user_profiles + "_" + args.arrival_frequency + args.car_profiles
-        if args.num_dc_groups is not None:
-            groupname += "_" + str(args.num_dc_groups)
-        env_parameters_str = "_".join([f"{k}_{v}" for k, v in env_parameters.items()])
-        groupname = f"{groupname}_{env_parameters_str}"
+        # groupname = args.groupname if args.groupname else args.user_profiles + "_" + args.arrival_frequency + args.car_profiles
+        # if args.num_dc_groups is not None:
+        #     groupname += "_" + str(args.num_dc_groups)
+        # env_parameters_str = "_".join([f"{k}_{v}" for k, v in env_parameters.items()])
+        # groupname = f"{groupname}_{env_parameters_str}"
         c_time = time.time()
-        wandb_tags = [args.runtag] if args.runtag is not None else []
-        wandb.init(
-            project="chargaxTest",
-            entity="shmvdhelm-technical-university-eindhoven",
-            config=merged_config,
-            group=groupname,
-            tags=wandb_tags,
-            dir="/var/scratch/kponse/wandb",
-            reinit=True
-        )
+        # wandb_tags = [args.runtag] if args.runtag is not None else []
+        # wandb.init(
+        #     project="chargaxTest",
+        #     entity="shmvdhelm-technical-university-eindhoven",
+        #     config=merged_config,
+        #     group=groupname,
+        #     tags=wandb_tags,
+        #     dir="/var/scratch/kponse/wandb",
+        #     reinit=True
+        # )
         trained_runner_state, train_rewards = random_trainer_train_fn()
         print("Training finished")
         print(f"Training took {time.time() - c_time:.2f} seconds")
@@ -290,8 +292,8 @@ if __name__ == "__main__":
 
         avg_reward = float(np.mean(np.array(train_rewards)))
 
-        print(f"Combination {params} -> avg reward: {avg_reward:.3f}")
-        wandb.log({"avg_reward": avg_reward})
+        print(f"avg reward: {avg_reward:.3f}")
+        # wandb.log({"avg_reward": avg_reward})
 
         if avg_reward > best_reward:
             best_reward = avg_reward
@@ -302,8 +304,78 @@ if __name__ == "__main__":
     #     elec_grid_sell_price=get_electricity_prices() - 0.1,
     #     full_info_dict=True
     # )
+    baselines = create_baseline_rewards(env)
+    random_trainer_train_fn, config = build_ppo_lagrangian_trainer(
+        env, 
+        config_params={
+            "total_timesteps": 10000000,
+            "seed": args.seed,
+            # ADDED lagranginan params
+            "cost_keys": (
+                "charged_satisfaction",   # -> uncharged_kw
+                "time_satisfaction",      # -> charged_overtime - beta*charged_undertime
+                "rejected_customers",     # -> rejected_customers
+                "capacity_exceeded",      # -> exceeded_capacity
+                "battery_degradation",    # -> total_discharged_kw
+            ),
+            "cost_limits": [
+                best_params['charged_satisfaction_cost_limits'],   # charged_satisfaction (uncharged_kw) per step
+                best_params['time_satisfaction_cost_limits'],   # time_satisfaction composite per step (aim ≤ 0)
+                best_params['rejected_customers_cost_limits'],   # rejected_customers per step
+                best_params['capacity_exceeded_cost_limits'],   # capacity_exceeded per step (hard)
+                best_params['battery_degradation_cost_limits'],   # battery_degradation proxy per step (if you want to discourage discharge)
+            ],
+            "alpha_init": best_params['alpha_init'],
+            "alpha_lr": best_params['alpha_lr'],
+            "alpha_max": best_params['alpha_max'],
+        },
+        baselines=baselines
+    )#, {"num_envs": 1, "total_timesteps": 1000})
 
-        wandb.finish()
+    filtered_env_dict = {
+        k: v for k, v in env.__dict__.items() if not isinstance(v, chex.Array)
+    }
+    merged_config = {
+        **filtered_env_dict,
+        **config.__dict__,
+        **params
+    }
+
+    start_time = time.time()
+    print("Starting JAX compilation...")
+    random_trainer_train_fn = jax.jit(random_trainer_train_fn).lower().compile()
+    print(
+        f"JAX compilation finished in {(time.time() - start_time):.2f} seconds, starting training..."
+    )
+    groupname = args.groupname if args.groupname else args.user_profiles + "_" + args.arrival_frequency + args.car_profiles
+    if args.num_dc_groups is not None:
+        groupname += "_" + str(args.num_dc_groups)
+    env_parameters_str = "_".join([f"{k}_{v}" for k, v in env_parameters.items()])
+    groupname = f"{groupname}_{env_parameters_str}"
+    c_time = time.time()
+    # wandb_tags = [args.runtag] if args.runtag is not None else []
+    wandb_tags = [f"{best_params}"]
+    wandb.init(
+        project="chargaxTest",
+        entity="shmvdhelm-technical-university-eindhoven",
+        config=merged_config,
+        group=groupname,
+        tags=wandb_tags,
+        dir="/var/scratch/kponse/wandb"
+    )
+    trained_runner_state, train_rewards = random_trainer_train_fn()
+    print("Training finished")
+    print(f"Training took {time.time() - c_time:.2f} seconds")
+
+    trained_agent = trained_runner_state[0]
+    key = trained_runner_state[-1]
+
+    avg_reward = float(np.mean(np.array(train_rewards)))
+
+    print(f"Combination {params} -> avg reward: {avg_reward:.3f}")
+    wandb.log({"avg_reward": avg_reward})
+
+    wandb.finish()
 
     # episode_reward, infos = eval_func(trained_agent, key)
     # breakpoint()
