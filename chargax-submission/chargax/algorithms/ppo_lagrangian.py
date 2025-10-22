@@ -3,7 +3,7 @@ import jax.numpy as jnp
 import equinox as eqx
 import chex
 import optax
-from typing import NamedTuple, List, Sequence
+from typing import NamedTuple, List, Sequence, Union, Mapping, Literal
 from dataclasses import replace, field
 from typing import Sequence, Dict, List, NamedTuple
 
@@ -58,7 +58,13 @@ class PPOConfig:
         "capacity_exceeded",
         "battery_degradation",
     )
-    cost_limits: jnp.ndarray = field(default_factory=lambda: jnp.array((0.0, 0.05, 0.0, 0.0, 0.0), dtype=jnp.float32))
+    # 22/10 change: cost_limits can be array or mapping, units per step or episode
+    #cost_limits: jnp.ndarray = field(default_factory=lambda: jnp.array((0.0, 0.05, 0.0, 0.0, 0.0), dtype=jnp.float32))
+    cost_limits: Union[jnp.ndarray, Mapping[str, float]] = field(
+        default_factory=lambda: jnp.array((0.0, 0.05, 0.0, 0.0, 0.0), dtype=jnp.float32)
+    )
+    cost_limit_units: Literal["per_step", "per_episode"] = "per_step"
+    
     alpha_init: float = 0.0 #Might have to change this
     alpha_lr: float = 1e-3 #Conservative
     alpha_max: float = 1e6
@@ -167,9 +173,27 @@ def build_ppo_lagrangian_trainer(
     
     # ADDED cost info
     beta = getattr(env, "beta", 0.0)
-    num_costs = len(tuple(config.cost_keys))
-    cost_limits = jnp.asarray(config.cost_limits, dtype=jnp.float32).reshape((num_costs,))
+    # 22/10 change:
+    # num_costs = len(tuple(config.cost_keys))
+    # cost_limits = jnp.asarray(config.cost_limits, dtype=jnp.float32).reshape((num_costs,))
     
+    num_costs = len(tuple(config.cost_keys))
+
+    # Turn cost_limits into a vector aligned with cost_keys
+    if isinstance(config.cost_limits, dict):
+        big = 1e9  # effectively unconstrained if not provided
+        limits_vec = jnp.array(
+            [config.cost_limits.get(k, big) for k in config.cost_keys],
+            dtype=jnp.float32
+        )
+    else:
+        limits_vec = jnp.asarray(config.cost_limits, dtype=jnp.float32).reshape((num_costs,))
+
+    # If user gave episode limits, convert to per-step averages for optimization
+    if config.cost_limit_units == "per_episode":
+        limits_vec = limits_vec / env.episode_length  # same as dividing sum by T
+
+    cost_limits = limits_vec
 
 
     # rng keys
@@ -588,10 +612,14 @@ def build_ppo_lagrangian_trainer(
                         }
 
                         # add the 5 constraint logs (order matches config.cost_keys)
+                        episode_len = env.episode_length
                         for i, name in enumerate(config.cost_keys):
                             log_dict[f"alpha/{name}"] = alphas[i]
                             log_dict[f"cost/{name}_mean"] = mean_costs[i]
                             log_dict[f"limit/{name}"] = cost_limits_arg[i]
+                            # 22/10 change
+                            log_dict[f"cost/{name}_mean_per_episode"] = mean_costs[i] * episode_len
+                            log_dict[f"limit/{name}_per_episode"] = cost_limits_arg[i] * episode_len
 
                         wandb.log(log_dict)
 
