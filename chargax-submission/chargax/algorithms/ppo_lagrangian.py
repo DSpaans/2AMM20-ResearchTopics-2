@@ -193,8 +193,7 @@ def build_ppo_lagrangian_trainer(
     if config.cost_limit_units == "per_episode":
         limits_vec = limits_vec / env.episode_length  # same as dividing sum by T
 
-    cost_limits_step = limits_vec
-    cost_limits_episode = limits_vec * env.episode_length  # for logging
+    cost_limits = limits_vec
 
 
     # rng keys
@@ -495,24 +494,24 @@ def build_ppo_lagrangian_trainer(
             
             # Lagrangian
             # trajectory_batch.costs must be collected during rollout: shape (num_steps, num_envs, num_costs)
-            # costs_batch = trajectory_batch.costs
-            # mean_costs = costs_batch.mean(axis=(0, 1))       # (num_costs,)
-            # violations = mean_costs - cost_limits            # (num_costs,)
+            costs_batch = trajectory_batch.costs
+            mean_costs = costs_batch.mean(axis=(0, 1))       # (num_costs,)
+            violations = mean_costs - cost_limits            # (num_costs,)
 
-            # new_alphas = jnp.clip(
-            #     train_state.alphas + config.alpha_lr * violations,
-            #     0.0,
-            #     config.alpha_max,
-            # )
+            new_alphas = jnp.clip(
+                train_state.alphas + config.alpha_lr * violations,
+                0.0,
+                config.alpha_max,
+            )
 
-            # # write alphas back into TrainState
-            # train_state = TrainState(
-            #     actor=train_state.actor,
-            #     critic=train_state.critic,
-            #     cost_critics=train_state.cost_critics,
-            #     optimizer_state=train_state.optimizer_state,
-            #     alphas=new_alphas,
-            # )
+            # write alphas back into TrainState
+            train_state = TrainState(
+                actor=train_state.actor,
+                critic=train_state.critic,
+                cost_critics=train_state.cost_critics,
+                optimizer_state=train_state.optimizer_state,
+                alphas=new_alphas,
+            )
             
             update_state = (train_state, trajectory_batch, advantages, returns, cost_advantages, cost_returns, rng, prev_logging)
             return update_state, total_loss
@@ -592,71 +591,15 @@ def build_ppo_lagrangian_trainer(
             metric["eval_rewards"] = eval_rewards
             
             costs_batch = trajectory_batch.costs
-            mean_costs_step = costs_batch.mean(axis=(0, 1))
-            
-            finished = metric["returned_episode"]
-            log = metric["logging_data"]
-            episode_len = env.episode_length
-            
-            def masked_mean(x):
-                num = finished.sum()
-                # avoid NaN
-                return jnp.where(
-                    num > 0,
-                    (jnp.where(finished, x, 0.0).sum()) / num,
-                    jnp.nan,
-                )
-            
-            # Map cost_keys -> episodic means using final logging values on finished steps
-            episodic_means_list = []
-            for name in config.cost_keys:
-                if name == "time_satisfaction":
-                    over = masked_mean(log["charged_overtime"])
-                    under = masked_mean(log["charged_undertime"])
-                    episodic_means_list.append(over - beta * under)
-                elif name == "charged_satisfaction":
-                    episodic_means_list.append(masked_mean(log["uncharged_kw"]))
-                elif name == "capacity_exceeded":
-                    episodic_means_list.append(masked_mean(log["exceeded_capacity"]))
-                elif name == "rejected_customers":
-                    episodic_means_list.append(masked_mean(log["rejected_customers"]))
-                elif name == "battery_degradation":
-                    episodic_means_list.append(masked_mean(log["total_discharged_kw"]))
-                else:
-                    # Allow direct logging metric names as cost_keys
-                    episodic_means_list.append(masked_mean(log[name]))
-            mean_costs_episode = jnp.stack(episodic_means_list, axis=0)
-            
-            num_finished = finished.sum()
-            def update_alpha(alphas, mean_ep, limits_ep):
-                violations_ep = mean_ep - limits_ep
-                new_alphas = jnp.clip(alphas + config.alpha_lr * violations_ep,
-                                    0.0, config.alpha_max)
-                return new_alphas
+            mean_costs = costs_batch.mean(axis=(0, 1))
 
-            new_alphas = jax.lax.cond(
-                num_finished > 0,
-                lambda _: update_alpha(train_state.alphas, mean_costs_episode, cost_limits_episode),
-                lambda _: train_state.alphas, # no change if no complete episodes
-                operand=None,
-            )
-
-            train_state = TrainState(
-                actor=train_state.actor,
-                critic=train_state.critic,
-                cost_critics=train_state.cost_critics,
-                optimizer_state=train_state.optimizer_state,
-                alphas=new_alphas,
-            )
-
-            def callback(info, alphas, mean_costs_step_arg, mean_costs_ep_arg,
-                        cost_limits_step_arg, cost_limits_ep_arg):
+            def callback(info, alphas, mean_costs, cost_limits_arg):
                 if config.debug:
                     print(f'timestep={(info["train_timestep"][-1][0] * config.num_envs)}, eval rewards={info["eval_rewards"]}')
                 if wandb.run:
                     if "logging_data" not in info:
                         info["logging_data"] = {}
-                    finished_episodes = info["returned_episode"]
+                    finished_episodes = info["returned_episode"] 
                     if finished_episodes.any():
                         info["logging_data"] = jax.tree.map(
                             lambda x: x[finished_episodes].mean(), info["logging_data"]
@@ -667,26 +610,20 @@ def build_ppo_lagrangian_trainer(
                             **info["logging_data"],
                             **logging_baselines,
                         }
+
+                        # add the 5 constraint logs (order matches config.cost_keys)
+                        episode_len = env.episode_length
                         for i, name in enumerate(config.cost_keys):
-                            # alphas
                             log_dict[f"alpha/{name}"] = alphas[i]
-                            # per-step view
-                            log_dict[f"cost/{name}_mean_per_step"] = mean_costs_step_arg[i]
-                            log_dict[f"limit/{name}_per_step"] = cost_limits_step_arg[i]
-                            # per-episode view (true episodic mean)
-                            log_dict[f"cost/{name}_mean_per_episode"] = mean_costs_ep_arg[i]
-                            log_dict[f"limit/{name}_per_episode"] = cost_limits_ep_arg[i]
+                            log_dict[f"cost/{name}_mean"] = mean_costs[i]
+                            log_dict[f"limit/{name}"] = cost_limits_arg[i]
+                            # 22/10 change
+                            log_dict[f"cost/{name}_mean_per_episode"] = mean_costs[i] * episode_len
+                            log_dict[f"limit/{name}_per_episode"] = cost_limits_arg[i] * episode_len
+
                         wandb.log(log_dict)
 
-            jax.debug.callback(
-                callback,
-                metric,
-                train_state.alphas,
-                mean_costs_step,
-                mean_costs_episode,
-                cost_limits_step,
-                cost_limits_episode,
-            )
+            jax.debug.callback(callback, metric, train_state.alphas, mean_costs, cost_limits)
 
             runner_state = (train_state, env_state, last_obs, rng, prev_logging)
             return runner_state, _ 

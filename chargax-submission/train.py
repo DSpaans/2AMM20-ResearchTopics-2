@@ -222,15 +222,15 @@ if __name__ == "__main__":
                 # 0.01,   # capacity_exceeded per step (hard)
                 # 0.05,   # battery_degradation proxy per step (if you want to discourage discharge)
                 
-                200.0,     # charged_satisfaction (uncharged_kw) per episode
+                15.0,     # charged_satisfaction (uncharged_kw) per episode
                 0.0,      # time_satisfaction per episode
-                100.0,      # rejected_customers per episode
-                0.0,      # capacity_exceeded per episode
-                5000.0,     # total_discharged_kw per episode
+                5.0,      # rejected_customers per episode
+                5.0,      # capacity_exceeded per episode
+                20.0,     # total_discharged_kw per episode
             ],
             "cost_limit_units": "per_episode",
             "alpha_init": 0.0,
-            "alpha_lr": 1e-1,
+            "alpha_lr": 1e-3,
             "alpha_max": 1e6,
         },
         baselines=baselines
