@@ -206,7 +206,37 @@ if __name__ == "__main__":
         env, 
         config_params={
             "total_timesteps": 10000000,
+<<<<<<< Updated upstream
             "seed": args.seed
+=======
+            "seed": args.seed,
+            # ADDED Lagrangian params
+            "cost_keys": (
+                "charged_satisfaction",   # -> uncharged_kw
+            #    "time_satisfaction",      # -> charged_overtime - beta*charged_undertime
+            #    "rejected_customers",     # -> rejected_customers
+            #    "capacity_exceeded",      # -> exceeded_capacity
+            #    "battery_degradation",    # -> total_discharged_kw
+            ),
+            "cost_limits": [
+                # 0.05,   # charged_satisfaction (uncharged_kw) per step
+                # 0.01,   # time_satisfaction composite per step (aim ≤ 0)
+                # 0.02,   # rejected_customers per step
+                # 0.01,   # capacity_exceeded per step (hard)
+                # 0.05,   # battery_degradation proxy per step (if you want to discourage discharge)
+                
+                200.0,     # charged_satisfaction (uncharged_kw) per episode
+            #    800.0,      # time_satisfaction per episode
+            #    45,      # rejected_customers per episode
+            #    0.0,      # capacity_exceeded per episode
+            #    4500.0,     # total_discharged_kw per episode
+            ],
+            "cost_limit_units": "per_episode",
+            "cost_vf_coef": 0.5,
+            "alpha_init": 0.2,
+            "alpha_lr": 1e-2,
+            "alpha_max": 1e6,
+>>>>>>> Stashed changes
         },
         baselines=baselines
     )#, {"num_envs": 1, "total_timesteps": 1000})
