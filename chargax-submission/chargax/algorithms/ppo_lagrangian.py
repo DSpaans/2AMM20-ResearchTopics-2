@@ -46,18 +46,26 @@ class PPOConfig:
     evaluate_deterministically: bool = False
 
     # ADDED Extra parameters for lagrangian PPO
-    cost_keys: Sequence[str] = (
-        "charged_satisfaction",
-        "time_satisfaction",
-        "rejected_customers",
-        "capacity_exceeded",
-        "battery_degradation",
-    )
+    # cost_keys: Sequence[str] = (
+    #     "charged_satisfaction",
+    #     "time_satisfaction",
+    #     "rejected_customers",
+    #     "capacity_exceeded",
+    #     "battery_degradation",
+    # )
     # 22/10 change: cost_limits can be array or mapping, units per step or episode
     #cost_limits: jnp.ndarray = field(default_factory=lambda: jnp.array((0.0, 0.05, 0.0, 0.0, 0.0), dtype=jnp.float32))
-    targets: Union[jnp.ndarray, Mapping[str, float]] = field(
-        default_factory=lambda: jnp.array((0.0, 0.0, 0.0, 0.0, 0.0), dtype=jnp.float32)
-    )
+    # targets: Union[jnp.ndarray, Mapping[str, float]] = field(
+    #     default_factory=lambda: jnp.array((0.0, 0.0, 0.0, 0.0, 0.0), dtype=jnp.float32)
+    # )
+
+    cost_targets: Dict[str, float] = field(default_factory=lambda:{
+        "charged_satisfaction": 0.0,
+        "time_satisfaction": 0.0,
+        "rejected_customers": 0.0,
+        "capacity_exceeded": 0.0,
+        "battery_degradation": 0.0,
+    })
     
     alpha_init: float = 0.0 #Might have to change this
     alpha_lr: float = 1e-3 #Conservative
@@ -99,6 +107,7 @@ class TrainState(NamedTuple):
     actor: eqx.Module
     critic: eqx.Module
     optimizer_state: optax.OptState
+    alphas: Dict[str, float]  # Lagrange multipliers for each cost
 
 # Jit the returned function, not this function
 def build_ppo_lagrangian_trainer(
@@ -122,7 +131,7 @@ def build_ppo_lagrangian_trainer(
     rng = jax.random.PRNGKey(config.seed)
     rng, network_key, reset_key = jax.random.split(rng, 3)
 
-    targets = config.targets
+    targets = config.cost_targets
 
     # networks
     actor, critic = create_ppo_networks(
@@ -153,10 +162,16 @@ def build_ppo_lagrangian_trainer(
         "critic": critic
     })
 
+    alphas_init = {
+        k: config.alpha_init
+        for k in targets.keys()
+    }
+
     train_state = TrainState(
         actor=actor,
         critic=critic,
-        optimizer_state=optimizer_state
+        optimizer_state=optimizer_state,
+        alphas=alphas_init,
     )
 
     rng, key = jax.random.split(rng)
@@ -297,7 +312,8 @@ def build_ppo_lagrangian_trainer(
                 train_state = TrainState(
                     actor=new_networks["actor"],
                     critic=new_networks["critic"],
-                    optimizer_state=optimizer_state
+                    optimizer_state=optimizer_state,
+                    alphas=train_state.alphas,
                 )
                 return train_state, total_loss
             
@@ -366,6 +382,7 @@ def build_ppo_lagrangian_trainer(
                     lambda x: jnp.sum(x * finished_episodes) / jnp.maximum(1, jnp.sum(finished_episodes)),
                     metric["logging_data"]
                 )
+            logging_data = metric["logging_data"]
             jax.debug.print("train step")
             jax.debug.print("charged_satisfaction: {}", jnp.mean(metric["logging_data"]["uncharged_kw"]))
             jax.debug.print("time_satisfaction: {}", jnp.mean(metric["logging_data"]["charged_overtime"]) - 1.0 * jnp.mean(metric["logging_data"]["charged_undertime"]))
@@ -373,6 +390,34 @@ def build_ppo_lagrangian_trainer(
             jax.debug.print("capacity_exceeded: {}", jnp.mean(metric["logging_data"]["exceeded_capacity"]))
             jax.debug.print("battery_degradation: {}", jnp.mean(metric["logging_data"]["total_discharged_kw"]))
 
+            means = {
+                "charged_satisfaction": jnp.mean(logging_data["uncharged_kw"]),
+                "time_satisfaction": jnp.mean(logging_data["charged_overtime"]
+                                    - 1.0 * logging_data["charged_undertime"]),
+                "rejected_customers": jnp.mean(logging_data["rejected_customers"]),
+                "capacity_exceeded":  jnp.mean(logging_data["exceeded_capacity"]),
+                "battery_degradation": jnp.mean(logging_data["total_discharged_kw"]),
+            }
+
+            violations = {
+                k: jnp.abs(means[k] - v)
+                for k, v in targets.items()
+            }
+
+            jax.debug.print("Lagrangian violations: {}", violations)
+
+            new_alphas = { 
+                k: jnp.clip(
+                    train_state.alphas[k] + config.alpha_lr * violations[k],
+                    0.0,
+                    config.alpha_max,)
+                for k in targets.keys() 
+            }
+
+            jax.debug.print("old alphas: {}", train_state.alphas)
+            jax.debug.print("new alphas: {}", new_alphas)
+
+            train_state = train_state._replace(alphas=new_alphas)
 
             def callback(info):
                 if config.debug:

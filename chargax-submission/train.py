@@ -209,26 +209,33 @@ if __name__ == "__main__":
             "total_timesteps": 10000,
             "seed": args.seed,
             # ADDED Lagrangian params
-            "cost_keys": (
-                "charged_satisfaction",   # -> uncharged_kw
-                "time_satisfaction",      # -> charged_overtime - beta*charged_undertime
-                "rejected_customers",     # -> rejected_customers
-                "capacity_exceeded",      # -> exceeded_capacity
-                "battery_degradation",    # -> total_discharged_kw
-            ),
-            "targets": [
-                # 0.05,   # charged_satisfaction (uncharged_kw) per step
-                # 0.01,   # time_satisfaction composite per step (aim ≤ 0)
-                # 0.02,   # rejected_customers per step
-                # 0.01,   # capacity_exceeded per step (hard)
-                # 0.05,   # battery_degradation proxy per step (if you want to discourage discharge)
+            # "cost_keys": (
+            #     "charged_satisfaction",   # -> uncharged_kw
+            #     "time_satisfaction",      # -> charged_overtime - beta*charged_undertime
+            #     "rejected_customers",     # -> rejected_customers
+            #     "capacity_exceeded",      # -> exceeded_capacity
+            #     "battery_degradation",    # -> total_discharged_kw
+            # ),
+            # "targets": [
+            #     # 0.05,   # charged_satisfaction (uncharged_kw) per step
+            #     # 0.01,   # time_satisfaction composite per step (aim ≤ 0)
+            #     # 0.02,   # rejected_customers per step
+            #     # 0.01,   # capacity_exceeded per step (hard)
+            #     # 0.05,   # battery_degradation proxy per step (if you want to discourage discharge)
                 
-                15.0,     # charged_satisfaction (uncharged_kw) per episode
-                0.0,      # time_satisfaction per episode
-                5.0,      # rejected_customers per episode
-                5.0,      # capacity_exceeded per episode
-                20.0,     # total_discharged_kw per episode
-            ],
+            #     15.0,     # charged_satisfaction (uncharged_kw) per episode
+            #     0.0,      # time_satisfaction per episode
+            #     5.0,      # rejected_customers per episode
+            #     5.0,      # capacity_exceeded per episode
+            #     20.0,     # total_discharged_kw per episode
+            # ],
+            "cost_targets" : {
+                # "charged_satisfaction": 15.0,   # maps to uncharged_kw
+                # "time_satisfaction":     0.0,   # maps to charged_overtime - beta * charged_undertime
+                "rejected_customers":    100.0,   # maps to rejected_customers
+                # "capacity_exceeded":     5.0,   # maps to exceeded_capacity
+                # "battery_degradation":  20.0,   # maps to total_discharged_kw
+            },
             # "cost_limit_units": "per_episode",
             "alpha_init": 0.0,
             "alpha_lr": 1e-3,
