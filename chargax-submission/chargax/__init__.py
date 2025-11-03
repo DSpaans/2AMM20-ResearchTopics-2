@@ -12,6 +12,7 @@ from .environment._data_loaders import get_scenario, get_electricity_prices, get
 
 from .algorithms.random import build_random_trainer
 from .algorithms.ppo import build_ppo_trainer
+from .algorithms.ppo_lagrangian import build_ppo_lagrangian_trainer
 
 # from chargax.environment import Chargax
 # from chargax.algorithms import build_random_trainer

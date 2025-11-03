@@ -5,7 +5,8 @@ from chargax import (
     get_car_data,
     pretty_print_charger_group,
     build_random_trainer,
-    build_ppo_trainer
+    build_ppo_trainer,
+    build_ppo_lagrangian_trainer,
 )
 
 import jax 
@@ -202,11 +203,36 @@ if __name__ == "__main__":
     )
 
     baselines = create_baseline_rewards(env)
-    random_trainer_train_fn, config = build_ppo_trainer(
+    random_trainer_train_fn, config = build_ppo_lagrangian_trainer(
         env, 
         config_params={
-            "total_timesteps": 10000000,
-            "seed": args.seed
+            "total_timesteps": 10000,
+            "seed": args.seed,
+            # ADDED Lagrangian params
+            "cost_keys": (
+                "charged_satisfaction",   # -> uncharged_kw
+                "time_satisfaction",      # -> charged_overtime - beta*charged_undertime
+                "rejected_customers",     # -> rejected_customers
+                "capacity_exceeded",      # -> exceeded_capacity
+                "battery_degradation",    # -> total_discharged_kw
+            ),
+            "targets": [
+                # 0.05,   # charged_satisfaction (uncharged_kw) per step
+                # 0.01,   # time_satisfaction composite per step (aim ≤ 0)
+                # 0.02,   # rejected_customers per step
+                # 0.01,   # capacity_exceeded per step (hard)
+                # 0.05,   # battery_degradation proxy per step (if you want to discourage discharge)
+                
+                15.0,     # charged_satisfaction (uncharged_kw) per episode
+                0.0,      # time_satisfaction per episode
+                5.0,      # rejected_customers per episode
+                5.0,      # capacity_exceeded per episode
+                20.0,     # total_discharged_kw per episode
+            ],
+            # "cost_limit_units": "per_episode",
+            "alpha_init": 0.0,
+            "alpha_lr": 1e-3,
+            "alpha_max": 1e6,
         },
         baselines=baselines
     )#, {"num_envs": 1, "total_timesteps": 1000})
@@ -232,14 +258,14 @@ if __name__ == "__main__":
     groupname = f"{groupname}_{env_parameters_str}"
     c_time = time.time()
     wandb_tags = [args.runtag] if args.runtag is not None else []
-    wandb.init(
-        project="chargaxTest",
-        entity="shmvdhelm-technical-university-eindhoven",
-        config=merged_config,
-        group=groupname,
-        tags=wandb_tags,
-        dir="/var/scratch/kponse/wandb"
-    )
+    # wandb.init(
+    #     project="chargaxTest",
+    #     entity="shmvdhelm-technical-university-eindhoven",
+    #     config=merged_config,
+    #     group=groupname,
+    #     tags=wandb_tags,
+    #     dir="/var/scratch/kponse/wandb"
+    # )
     trained_runner_state, train_rewards = random_trainer_train_fn()
     print("Training finished")
     print(f"Training took {time.time() - c_time:.2f} seconds")
@@ -253,7 +279,7 @@ if __name__ == "__main__":
     #     full_info_dict=True
     # )
 
-    wandb.finish()
+    # wandb.finish()
 
     # episode_reward, infos = eval_func(trained_agent, key)
     # breakpoint()
