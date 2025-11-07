@@ -12,12 +12,14 @@ import jax
 import jax.numpy as jnp
 import time
 import wandb
-from dataclasses import replace
+from dataclasses import replace, asdict
 import chex
 from typing import Literal
 import numpy as np
 import equinox as eqx
 import argparse
+
+from chargax.algorithms.ppo_lagrangian_chargax import build_ppo_lagrangian_trainer
 
 def eval_func(train_state, rng):
 
@@ -167,6 +169,14 @@ if __name__ == "__main__":
     argument_parser.add_argument("--runtag", type=str, default=None)
     argument_parser.add_argument("--car_profiles", type=str, default="eu")
     argument_parser.add_argument("--num_dc_groups", type=int, default=5)
+    argument_parser.add_argument("--use_lagrangian", type=int, default=1)
+    argument_parser.add_argument("--thr_exceeded_capacity", type=float, default=0.0)   # per step #0.0
+    argument_parser.add_argument("--thr_uncharged_kw", type=float, default=90.0)       # per episode #90.0
+    argument_parser.add_argument("--thr_rejected_customers", type=float, default=40.0)  # per episode #40.0
+    argument_parser.add_argument("--thr_total_discharged_kw", type=float, default=100.0)  # per episode #100.0
+    argument_parser.add_argument("--lambda_lr", type=float, default=0.05) #0.05
+    argument_parser.add_argument("--lambda_init", type=float, default=0.01)
+    argument_parser.add_argument("--lambda_update_every", type=int, default=1)
     args, extra_args = argument_parser.parse_known_args()
 
     # Convert extra_args to a dictionary. we assume that they set environment parameters.
@@ -202,26 +212,57 @@ if __name__ == "__main__":
     )
 
     baselines = create_baseline_rewards(env)
-    random_trainer_train_fn, config = build_ppo_trainer(
-        env, 
-        config_params={
-            "total_timesteps": 10000000,
-            "seed": args.seed
-        },
-        baselines=baselines
-    )#, {"num_envs": 1, "total_timesteps": 1000})
+    if args.use_lagrangian:
+        train_fn, config = build_ppo_lagrangian_trainer(
+            env,
+            ppo_config={
+                "total_timesteps": 10000000,
+                "seed": args.seed
+            },
+            lag_config={
+                "lambda_lr": args.lambda_lr,
+                "lambda_init": args.lambda_init,
+                "penalty_update_frequency": args.lambda_update_every,
+                "thresholds": {
+                    "exceeded_capacity": args.thr_exceeded_capacity,
+                    "uncharged_kw": args.thr_uncharged_kw,
+                    "rejected_customers": args.thr_rejected_customers,
+                    "total_discharged_kw": args.thr_total_discharged_kw,
+                },
+            },
+            baselines=baselines,
+        )
+    else:
+        train_fn, config = build_ppo_trainer(
+            env,
+            config_params={
+                "total_timesteps": 10000000,
+                "seed": args.seed
+            },
+            baselines=baselines,
+        )
 
     filtered_env_dict = {
-        k: v for k, v in env.__dict__.items() if not isinstance(v, chex.Array)
+    k: v for k, v in env.__dict__.items() if not isinstance(v, chex.Array)
     }
+
+    # Convert PPOConfig (chex.dataclass) or future configs to a plain dict
+    if hasattr(config, "_asdict"):          # e.g. NamedTuple-style configs
+        config_dict = config._asdict()
+    elif hasattr(config, "__dataclass_fields__"):
+        config_dict = asdict(config)        # dataclass / chex.dataclass
+    else:
+        # Fallback: best-effort generic conversion
+        config_dict = {k: getattr(config, k) for k in dir(config) if not k.startswith("_")}
+
     merged_config = {
         **filtered_env_dict,
-        **config.__dict__
+        **config_dict,
     }
 
     start_time = time.time()
     print("Starting JAX compilation...")
-    random_trainer_train_fn = jax.jit(random_trainer_train_fn).lower().compile()
+    train_fn = jax.jit(train_fn).lower().compile()
     print(
         f"JAX compilation finished in {(time.time() - start_time):.2f} seconds, starting training..."
     )
@@ -240,7 +281,7 @@ if __name__ == "__main__":
         tags=wandb_tags,
         dir="/var/scratch/kponse/wandb"
     )
-    trained_runner_state, train_rewards = random_trainer_train_fn()
+    trained_runner_state, train_rewards = train_fn()
     print("Training finished")
     print(f"Training took {time.time() - c_time:.2f} seconds")
 
