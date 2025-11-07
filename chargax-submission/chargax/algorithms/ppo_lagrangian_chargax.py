@@ -75,13 +75,6 @@ class LagrangianConfig(NamedTuple):
     lambda_lr: float = 0.05
     lambda_init: float = 0.01
     penalty_update_frequency: int = 1  # update lambdas every K PPO iterations
-    # Constraints (episode-level thresholds unless noted)
-    # thresholds: Dict[str, float] = {
-    #     "exceeded_capacity": 5.0,        # kW per step (instantaneous)
-    #     "uncharged_kw": 100.0,            # kWh per episode
-    #     "rejected_customers": 20.0,       # count per episode
-    #     "total_discharged_kw": 4500.0,    # kWh per episode (proxy for degradation)
-    # }
     thresholds: Dict[str, float] | None = None
 
 
@@ -94,16 +87,16 @@ class TrainStateLag(NamedTuple):
 
 
 def _extract_logging_series(info_tree) -> Dict[str, jnp.ndarray]:
-    """""""""Return series with shape (T, N) for each metric from the batched trajectory info.
+    """Return series with shape (T, N) for each metric from the batched trajectory info.
     Expected keys inside info['logging_data']: exceeded_capacity (per-step),
     uncharged_kw (cumulative), rejected_customers (cumulative), total_discharged_kw (cumulative).
-    """""""""
-    ld = info_tree["""logging_data"""]
+    """
+    ld = info_tree["logging_data"]
     out = {
-        """exceeded_capacity""": ld["""exceeded_capacity"""],        # (T, N)
-        """uncharged_kw""": ld["""uncharged_kw"""],                  # (T, N) cumulative
-        """rejected_customers""": ld["""rejected_customers"""],      # (T, N) cumulative
-        """total_discharged_kw""": ld["""total_discharged_kw"""],    # (T, N) cumulative
+        "exceeded_capacity": ld["exceeded_capacity"],        # (T, N)
+        "uncharged_kw": ld["uncharged_kw"],                  # (T, N) cumulative
+        "rejected_customers": ld["rejected_customers"],      # (T, N) cumulative
+        "total_discharged_kw": ld["total_discharged_kw"],    # (T, N) cumulative
     }
     return out
 
@@ -116,20 +109,16 @@ def _first_diff_along_time(x: jnp.ndarray) -> jnp.ndarray:
 
 
 def _per_step_constraints(info_tree, num_steps: int) -> jnp.ndarray:
-    """""""""Build (T, N, 4) per-step constraint array in fixed order:
-    [exceeded_capacity, uncharged_kw, rejected_customers, total_discharged_kw].
-    exceeded_capacity is already per-step; others are converted to per-step increments via diff.
-    """""""""
     series = _extract_logging_series(info_tree)
-    exceeded = series["""exceeded_capacity"""]
-    uncharged = _first_diff_along_time(series["""uncharged_kw"""])
-    rejected = _first_diff_along_time(series["""rejected_customers"""])
-    degr = _first_diff_along_time(series["""total_discharged_kw"""])
+    exceeded = series["exceeded_capacity"]
+    uncharged = _first_diff_along_time(series["uncharged_kw"])
+    rejected = _first_diff_along_time(series["rejected_customers"])
+    degr = _first_diff_along_time(series["total_discharged_kw"])
     return jnp.stack([exceeded, uncharged, rejected, degr], axis=-1)  # (T, N, 4)
 
 
 def _episode_totals_from_series(info_tree) -> jnp.ndarray:
-    """""""""Return (N, 4) episode totals to update lambdas. Uses the same order as above."""""""""
+    # Return (N, 4) episode totals to update lambdas. Uses the same order as above.
     series = _extract_logging_series(info_tree)
     done = info_tree["returned_episode"]
     exceeded_total = (series["""exceeded_capacity"""] * 1.0).sum(axis=0)         # sum over time
@@ -147,28 +136,6 @@ def build_ppo_lagrangian_trainer(
     lag_config: Dict = {},
     baselines: Dict = {},
 ):
-    # """""""""Drop-in alternative for build_ppo_trainer with Lagrangian penalties.
-
-    # Usage (in train.py):
-    #     from ppo_lagrangian_chargax import build_ppo_lagrangian_trainer
-    #     train, cfg = build_ppo_lagrangian_trainer(env, ppo_config, {
-    #         """thresholds""": {
-    #             """exceeded_capacity""": 0.0,
-    #             """uncharged_kw""": 40.0,
-    #             """rejected_customers""": 1.0,
-    #             """total_discharged_kw""": 80.0,
-    #         },
-    #         """lambda_lr""": 0.05,
-    #         """penalty_update_frequency""": 1,
-    #     })
-    #     trained_state, logs = train()
-
-    # Notes:
-    # - We assume rollout length equals episode length (as in your current PPO: num_steps == env.episode_length).
-    # - Thresholds for cumulative metrics are per episode; for per-step penalty we divide by num_steps.
-    # - Lagrange multipliers are updated every `penalty_update_frequency` PPO iterations using episode totals.
-    # """""""""
-
     # Wrap env (same as PPO)
     env = LogWrapper(env)
     env = NormalizeVecObservation(env)
@@ -272,7 +239,7 @@ def build_ppo_lagrangian_trainer(
 
     def train_func(rng_outer=rng):
 
-        # ------- Inner helpers (inside jit/scan) -------
+        #  Inner helpers (inside jit/scan)
         def _env_step(runner_state, _):
             train_state, env_state, last_obs, rng = runner_state
             rng, sample_key, step_key = jax.random.split(rng, 3)
@@ -373,20 +340,20 @@ def build_ppo_lagrangian_trainer(
 
         def train_step(runner_state, _):
 
-            # 1) Rollout
+            # Rollout
             runner_state, trajectory_batch = jax.lax.scan(_env_step, runner_state, None, cfg.num_steps)
 
-            # 2) Build per-step penalties
+            # Build per-step penalties
             # (T, N, 4) instantaneous constraint values
             constraint_steps = _per_step_constraints(trajectory_batch.info, cfg.num_steps)
 
-            # thresholds per step (exceeded_capacity is per-step already; others per-episode / T)
+            # thresholds per step
             per_step_thresholds = jnp.array([
                 thresholds_vec[0],
                 thresholds_vec[1] / cfg.num_steps,
                 thresholds_vec[2] / cfg.num_steps,
                 thresholds_vec[3] / cfg.num_steps,
-            ])  # (4,)
+            ])
 
             # excess violations (T, N, 4)
             excess = jnp.maximum(0.0, constraint_steps - per_step_thresholds)
