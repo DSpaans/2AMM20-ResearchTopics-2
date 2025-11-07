@@ -170,10 +170,10 @@ if __name__ == "__main__":
     argument_parser.add_argument("--car_profiles", type=str, default="eu")
     argument_parser.add_argument("--num_dc_groups", type=int, default=5)
     argument_parser.add_argument("--use_lagrangian", type=int, default=1)
-    argument_parser.add_argument("--thr_exceeded_capacity", type=float, default=0.0)   # per step #0.0
-    argument_parser.add_argument("--thr_uncharged_kw", type=float, default=90.0)       # per episode #90.0
-    argument_parser.add_argument("--thr_rejected_customers", type=float, default=40.0)  # per episode #40.0
-    argument_parser.add_argument("--thr_total_discharged_kw", type=float, default=100.0)  # per episode #100.0
+    argument_parser.add_argument("--thr_exceeded_capacity", type=float, default=1.0)   # per step #0.0
+    argument_parser.add_argument("--thr_uncharged_kw", type=float, default=10000.0)       # per episode #90.0
+    argument_parser.add_argument("--thr_rejected_customers", type=float, default=5.0)  # per episode #40.0
+    argument_parser.add_argument("--thr_total_discharged_kw", type=float, default=10000.0)  # per episode #100.0
     argument_parser.add_argument("--lambda_lr", type=float, default=0.05) #0.05
     argument_parser.add_argument("--lambda_init", type=float, default=0.01)
     argument_parser.add_argument("--lambda_update_every", type=int, default=1)

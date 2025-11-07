@@ -131,11 +131,13 @@ def _per_step_constraints(info_tree, num_steps: int) -> jnp.ndarray:
 def _episode_totals_from_series(info_tree) -> jnp.ndarray:
     """""""""Return (N, 4) episode totals to update lambdas. Uses the same order as above."""""""""
     series = _extract_logging_series(info_tree)
-    exceeded_total = series["""exceeded_capacity"""].sum(axis=0)         # sum over time
+    done = info_tree["returned_episode"]
+    exceeded_total = (series["""exceeded_capacity"""] * 1.0).sum(axis=0)         # sum over time
     # for cumulative metrics, just take the last time step
-    uncharged_total = series["""uncharged_kw"""][-1]
-    rejected_total = series["""rejected_customers"""][-1]
-    degr_total = series["""total_discharged_kw"""][-1]
+    uncharged_total = (series["""uncharged_kw"""] * done).sum(axis=0) 
+    rejected_total = (series["""rejected_customers"""] * done).sum(axis=0) 
+    degr_total = (series["""total_discharged_kw"""] * done).sum(axis=0) 
+    # jax.debug.print("Episode totals: rejected_customers={}:", rejected_total)
     return jnp.stack([exceeded_total, uncharged_total, rejected_total, degr_total], axis=-1)  # (N, 4)
 
 
